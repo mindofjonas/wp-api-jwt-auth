@@ -3,7 +3,8 @@
         "vendor-dir": "includes/vendor"
     },
     "require": {
-        "firebase/php-jwt": "^3.0"
+        "firebase/php-jwt": "^3.0",
+		"donatj/phpuseragentparser": "*"
     },
     "require-dev": {
         "phpunit/phpunit": "^5.2",

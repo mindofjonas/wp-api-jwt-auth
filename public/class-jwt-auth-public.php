@@ -81,6 +81,11 @@ class Jwt_Auth_Public
             'methods' => 'POST',
             'callback' => array($this, 'validate_token'),
         ));
+
+        register_rest_route($this->namespace, 'token/revoke', array(
+            'methods' => 'POST',
+            'callback' => array($this, 'revoke_token'),
+        ));
     }
 
     /**
@@ -138,7 +143,11 @@ class Jwt_Auth_Public
         $notBefore = apply_filters('jwt_auth_not_before', $issuedAt, $issuedAt);
         $expire = apply_filters('jwt_auth_expire', $issuedAt + (DAY_IN_SECONDS * 7), $issuedAt);
 
+		// Generate UID for this token
+		$uuid = wp_generate_uuid4();
+
         $token = array(
+			'uuid' => $uuid,
             'iss' => get_bloginfo('url'),
             'iat' => $issuedAt,
             'nbf' => $notBefore,
@@ -153,12 +162,26 @@ class Jwt_Auth_Public
         /** Let the user modify the token data before the sign. */
         $token = JWT::encode(apply_filters('jwt_auth_token_before_sign', $token, $user), $secret_key);
 
+		$jwt_data = get_user_meta( $user->data->ID, 'jwt_data', true ) ?: array();
+		$user_ip = ! empty( $_SERVER['REMOTE_ADDR'] ) ? $_SERVER['REMOTE_ADDR'] : __( 'Unknown', 'jwt-auth' );
+		$jwt_data[] = array(
+			'uuid' => $uuid,
+			'issued_at' => $issuedAt,
+			'expires' => $expire,
+			'ip' => $user_ip,
+			'ua' => $_SERVER['HTTP_USER_AGENT'],
+            'last_used' => time(),
+		);
+		update_user_meta( $user->data->ID, 'jwt_data', $jwt_data );
+
         /** The token is signed, now create the object with no sensible user data to the client*/
         $data = array(
             'token' => $token,
+			'user_id' => $user->data->ID,
             'user_email' => $user->data->user_email,
             'user_nicename' => $user->data->user_nicename,
             'user_display_name' => $user->data->display_name,
+			'token_expires' => $expire,
         );
 
         /** Let the user modify the data before send it back */
@@ -208,6 +231,7 @@ class Jwt_Auth_Public
                 return $user;
             }
         }
+
         /** Everything is ok, return the user ID stored in the token*/
         return $token->data->user->id;
     }
@@ -296,6 +320,46 @@ class Jwt_Auth_Public
                     )
                 );
             }
+
+			// Custom validation against an UUID on user meta data.
+			$jwt_data = get_user_meta( $token->data->user->id, 'jwt_data', true ) ?: false;
+			if ( false === $jwt_data ) {
+				return new WP_Error(
+	                'jwt_auth_token_revoked',
+	                __('Token has been revoked.', 'jwt-auth'),
+	                array(
+	                    'status' => 403,
+	                )
+	            );
+			}
+
+			/**
+			 * Loop through and check wether we have the current token uuid in the users meta.
+			 */
+			foreach( $jwt_data as $key => $token_data ) {
+                if ( $token_data['uuid'] == $token->uuid ) {
+                    $user_ip = ! empty( $_SERVER['REMOTE_ADDR'] ) ? $_SERVER['REMOTE_ADDR'] : __( 'Unknown', 'jwt-auth' );
+                    $jwt_data[ $key ]['last_used'] = time();
+                    $jwt_data[ $key ]['ua'] = $_SERVER['HTTP_USER_AGENT'];
+                    $jwt_data[ $key ]['ip'] = $user_ip;
+                    $valid_token = true;
+                    break;
+                }
+                $valid_token = false;
+            }
+
+			// Found no valid token. Return error.
+			if ( false == $valid_token ) {
+				return new WP_Error(
+	                'jwt_auth_token_revoked',
+	                __('Token has been revoked.', 'jwt-auth'),
+	                array(
+	                    'status' => 403,
+	                )
+	            );
+			}
+
+
             /** Everything looks good return the decoded token if the $output is false */
             if (!$output) {
                 return $token;
@@ -319,6 +383,52 @@ class Jwt_Auth_Public
          }
     }
 
+
+    /**
+	 * Check if we should revoke a token.
+	 *
+	 */
+	public function revoke_token( ) {
+
+        $token = $this->validate_token( false );
+
+        if ( is_wp_error( $token ) ) {
+            if ($token->get_error_code() != 'jwt_auth_no_auth_header') {
+                /** If there is a error, store it to show it after see rest_pre_dispatch */
+                $this->jwt_error = $token;
+                return false;
+            } else {
+                return false;
+            }
+        }
+
+        $tokens = get_user_meta( $token->data->user->id, 'jwt_data', true ) ?: false;
+        $token_uuid = $token->uuid;
+
+        if ( $tokens ) {
+            foreach ( $tokens as $key => $token_data ) {
+                if ( $token_data['uuid'] == $token_uuid ) {
+                    unset( $tokens[ $key ] );
+                    update_user_meta( $token->data->user->id , 'jwt_data', $tokens );
+                    return array(
+                        'code' => 'jwt_auth_revoked_token',
+                        'data' => array(
+                            'status' => 200,
+                        ),
+                    );
+                }
+            }
+        }
+
+        return array(
+            'code' => 'jwt_auth_no_token_to_revoke',
+            'data' => array(
+                'status' => 403,
+            ),
+        );
+
+	}
+
     /**
      * Filter to hook the rest_pre_dispatch, if the is an error in the request
      * send it, if there is no error just continue with the current request.
@@ -332,4 +442,110 @@ class Jwt_Auth_Public
         }
         return $request;
     }
+
+
+
+	/**
+	 * Adds a token UI metabox to each user.
+	 *
+	 */
+	public function user_token_ui( $user ) {
+		if ( current_user_can( 'edit_user' ) ) {
+			$tokens = get_user_meta( $user->ID, 'jwt_data', true ) ?: false;
+			include plugin_dir_path( __FILE__ ) . 'views/user-token-ui.php';
+
+		}
+
+	}
+
+
+	/**
+	 * Check if we should revoke a token.
+	 *
+	 */
+	public function maybe_revoke_token( $user ) {
+		if ( current_user_can( 'edit_user' ) && ! empty( $_GET['revoke_token'] ) ) {
+
+			$tokens = get_user_meta( $user->ID, 'jwt_data', true ) ?: false;
+			$request_token = $_GET['revoke_token'];
+
+            if ( $tokens ) {
+                foreach ( $tokens as $key => $token ) {
+                    if ( $token['uuid'] == $_GET['revoke_token'] ) {
+                        unset( $tokens[ $key ] );
+                        update_user_meta( $user->ID , 'jwt_data', $tokens );
+                        break;
+                    }
+                }
+            }
+
+			$redirect_url = home_url() . remove_query_arg( array( 'revoke_token' ) );
+			wp_safe_redirect( $redirect_url );
+			exit;
+
+		}
+
+	}
+
+
+    /**
+	 * Check if we should revoke a token.
+	 *
+	 */
+	public function maybe_revoke_all_tokens( $user ) {
+		if ( current_user_can( 'edit_user' ) && ! empty( $_GET['revoke_all_tokens'] ) ) {
+            delete_user_meta( $user->ID, 'jwt_data');
+
+			$redirect_url = home_url() . remove_query_arg( array( 'revoke_all_tokens' ) );
+			wp_safe_redirect( $redirect_url );
+			exit;
+
+		}
+
+	}
+
+
+    /**
+	 * Check if we should revoke a token.
+	 *
+	 */
+	public function maybe_remove_expired_tokens( $user ) {
+		if ( current_user_can( 'edit_user' ) && ! empty( $_GET['remove_expired_tokens'] ) ) {
+
+			$tokens = get_user_meta( $user->ID, 'jwt_data', true ) ?: false;
+            if ( $tokens ) {
+                foreach ( $tokens as $key => $token ) {
+                    if ( $token['expires'] < time() ) {
+                        unset( $tokens[ $key ] );
+                    }
+                }
+                update_user_meta( $user->ID , 'jwt_data', $tokens );
+            }
+
+			$redirect_url = home_url() . remove_query_arg( array( 'remove_expired_tokens' ) );
+			wp_safe_redirect( $redirect_url );
+			exit;
+
+		}
+
+	}
+
+
+	/**
+	 * Get current user IP.
+	 *
+	 */
+	private function get_IP() {
+	    foreach (array('HTTP_CLIENT_IP', 'HTTP_X_FORWARDED_FOR', 'HTTP_X_FORWARDED', 'HTTP_X_CLUSTER_CLIENT_IP', 'HTTP_FORWARDED_FOR', 'HTTP_FORWARDED', 'REMOTE_ADDR') as $key) {
+	        if (array_key_exists($key, $_SERVER) === true) {
+	            foreach (array_map('trim', explode(',', $_SERVER[$key])) as $ip) {
+	                if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) !== false) {
+	                    return $ip;
+	                }
+	            }
+	        }
+	    }
+	}
+
+
 }
