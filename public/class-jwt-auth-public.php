@@ -86,6 +86,11 @@ class Jwt_Auth_Public
             'methods' => 'POST',
             'callback' => array($this, 'revoke_token'),
         ));
+
+        register_rest_route($this->namespace, 'token/resetpassword', array(
+            'methods' => 'POST',
+            'callback' => array($this, 'reset_password'),
+        ));
     }
 
     /**
@@ -428,6 +433,107 @@ class Jwt_Auth_Public
         );
 
 	}
+
+
+    /**
+     * Endpoint for requesting a password reset link.
+     * This is a slightly modified version of what WP core uses.
+     * @param object $request the request object that come in from WP Rest API.
+     */
+    public function reset_password( $request ) {
+        $username = $request->get_param( 'username' );
+        if ( ! $username ) {
+            return array(
+                'code' => 'jwt_auth_invalid_username',
+                'message' => __( '<strong>Error:</strong> Username or email not specified.', 'jwt-auth' ),
+                'data' => array(
+                    'status' => 403,
+                ),
+            );
+        } elseif ( strpos( $username, '@' ) ) {
+            $user_data = get_user_by( 'email', trim( $username ) );
+        } else {
+            $user_data = get_user_by( 'login', trim( $username ) );
+        }
+
+        global $wpdb, $current_site;
+
+        do_action('lostpassword_post');
+        if ( !$user_data ) {
+            return array(
+                'code' => 'jwt_auth_invalid_username',
+                'message' => __( '<strong>Error:</strong> Invalid username.', 'jwt-auth' ),
+                'data' => array(
+                    'status' => 403,
+                ),
+            );
+        }
+
+        // redefining user_login ensures we return the right case in the email
+        $user_login = $user_data->user_login;
+        $user_email = $user_data->user_email;
+
+        do_action('retreive_password', $user_login);  // Misspelled and deprecated
+        do_action('retrieve_password', $user_login);
+
+        $allow = apply_filters('allow_password_reset', true, $user_data->ID);
+
+        if ( ! $allow ) {
+            return array(
+                'code' => 'jwt_auth_reset_password_not_allowed',
+                'message' => __( '<strong>Error:</strong> Resetting password is not allowed.', 'jwt-auth' ),
+                'data' => array(
+                    'status' => 403,
+                ),
+            );
+        } else if ( is_wp_error( $allow ) ) {
+            return array(
+                'code' => 'jwt_auth_reset_password_not_allowed',
+                'message' => __( '<strong>Error:</strong> Resetting password is not allowed.', 'jwt-auth' ),
+                'data' => array(
+                    'status' => 403,
+                ),
+            );
+        }
+
+        $key = $wpdb->get_var($wpdb->prepare("SELECT user_activation_key FROM $wpdb->users WHERE user_login = %s", $user_login));
+        if ( empty($key) ) {
+            // Generate something random for a key...
+            $key = wp_generate_password(20, false);
+            do_action('retrieve_password_key', $user_login, $key);
+            // Now insert the new md5 key into the db
+            $wpdb->update($wpdb->users, array('user_activation_key' => $key), array('user_login' => $user_login));
+        }
+        $message = __('Someone requested that the password be reset for the following account:') . "\r\n\r\n";
+        $message .= network_home_url( '/' ) . "\r\n\r\n";
+        $message .= sprintf(__('Username: %s'), $user_login) . "\r\n\r\n";
+        $message .= __('If this was a mistake, just ignore this email and nothing will happen.') . "\r\n\r\n";
+        $message .= __('To reset your password, visit the following address:') . "\r\n\r\n";
+        $message .= '<' . network_site_url("wp-login.php?action=rp&key=$key&login=" . rawurlencode($user_login), 'login') . ">\r\n";
+
+        if ( is_multisite() )
+            $blogname = $GLOBALS['current_site']->site_name;
+        else
+            // The blogname option is escaped with esc_html on the way into the database in sanitize_option
+            // we want to reverse this for the plain text arena of emails.
+            $blogname = wp_specialchars_decode(get_option('blogname'), ENT_QUOTES);
+
+        $title = sprintf( __('[%s] Password Reset'), $blogname );
+
+        $title = apply_filters('retrieve_password_title', $title);
+        $message = apply_filters('retrieve_password_message', $message, $key);
+
+        if ( $message && !wp_mail($user_email, $title, $message) )
+            wp_die( __('The e-mail could not be sent.') . "<br />\n" . __('Possible reason: your host may have disabled the mail() function...') );
+
+        return array(
+            'code' => 'jwt_auth_password_reset',
+            'message' => __( '<strong>Success:</strong> an email for selecting a new password has been sent.', 'jwt-auth' ),
+            'data' => array(
+                'status' => 200,
+            ),
+        );
+    }
 
     /**
      * Filter to hook the rest_pre_dispatch, if the is an error in the request
